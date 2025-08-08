@@ -1,3 +1,13 @@
+/**
+ * index.js
+ * Entry point for the Ultravox Speech-to-Speech streaming application.
+ * This server handles real-time audio streaming between clients and Ultravox's API,
+ * performing necessary audio format conversions and WebSocket communication.
+ *
+ * @author Agent Voice Response <info@agentvoiceresponse.com>
+ * @see https://www.agentvoiceresponse.com
+ */
+
 const express = require("express");
 const axios = require("axios");
 const WebSocket = require("ws");
@@ -20,7 +30,7 @@ const ULTRAVOX_CLIENT_BUFFER_SIZE_MS =
  * Connects to Ultravox API and returns an open WebSocket connection
  * @returns {Promise<WebSocket>} The WebSocket connection to Ultravox
  */
-async function connectToUltravox() {
+async function connectToUltravox(uuid) {
   console.log(
     "Connecting to Ultravox API",
     ULTRAVOX_API_URL,
@@ -30,6 +40,9 @@ async function connectToUltravox() {
   const response = await axios.post(
     ULTRAVOX_API_URL,
     {
+      metadata: {
+        uuid: uuid,
+      },  
       medium: {
         serverWebSocket: {
           inputSampleRate: ULTRAVOX_SAMPLE_RATE,
@@ -62,7 +75,10 @@ async function connectToUltravox() {
  * @param {Response} res - Express response object
  */
 const handleAudioStream = async (req, res) => {
-  const ultravoxWebSocket = await connectToUltravox();
+  const uuid = req.headers['x-uuid'];
+  console.log('Received UUID:', uuid);
+  
+  const ultravoxWebSocket = await connectToUltravox(uuid);
 
   ultravoxWebSocket.on("open", () => {
     console.log("WebSocket connected to Ultravox");
