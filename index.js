@@ -3,6 +3,7 @@
  * Entry point for the Ultravox Speech-to-Speech streaming application.
  * This server handles real-time audio streaming between clients and Ultravox's API,
  * performing necessary audio format conversions and WebSocket communication.
+ * Supports both agent-specific calls and generic calls.
  *
  * @author Agent Voice Response <info@agentvoiceresponse.com>
  * @see https://www.agentvoiceresponse.com
@@ -16,33 +17,52 @@ require("dotenv").config();
 // Initialize Express application
 const app = express();
 
-if (!process.env.ULTRAVOX_AGENT_ID) {
-  throw new Error("ULTRAVOX_AGENT_ID is not set");
+// Configuration for call type
+const CALL_TYPE = process.env.ULTRAVOX_CALL_TYPE || 'agent'; // 'agent' or 'generic'
+const ULTRAVOX_AGENT_ID = process.env.ULTRAVOX_AGENT_ID;
+
+// Validate configuration based on call type
+if (CALL_TYPE === 'agent' && !ULTRAVOX_AGENT_ID) {
+  throw new Error("ULTRAVOX_AGENT_ID is required when CALL_TYPE is 'agent'");
 }
 
 // Get the configurable Ultravox sample rate
 const ULTRAVOX_SAMPLE_RATE = 8000;
-const ULTRAVOX_API_URL = `https://api.ultravox.ai/api/agents/${process.env.ULTRAVOX_AGENT_ID}/calls`;
 const ULTRAVOX_CLIENT_BUFFER_SIZE_MS =
   process.env.ULTRAVOX_CLIENT_BUFFER_SIZE_MS || 60;
 
+// API URLs based on call type
+const getApiUrl = () => {
+  if (CALL_TYPE === 'agent') {
+    return `https://api.ultravox.ai/api/agents/${ULTRAVOX_AGENT_ID}/calls`;
+  } else {
+    return 'https://api.ultravox.ai/api/calls';
+  }
+};
+
 /**
  * Connects to Ultravox API and returns an open WebSocket connection
+ * @param {string} uuid - The unique identifier for the call
  * @returns {Promise<WebSocket>} The WebSocket connection to Ultravox
  */
 async function connectToUltravox(uuid) {
+  const apiUrl = getApiUrl();
   console.log(
-    "Connecting to Ultravox API",
-    ULTRAVOX_API_URL,
+    `Connecting to Ultravox API (${CALL_TYPE} call)`,
+    apiUrl,
     ULTRAVOX_SAMPLE_RATE,
     ULTRAVOX_CLIENT_BUFFER_SIZE_MS
   );
-  const response = await axios.post(
-    ULTRAVOX_API_URL,
-    {
+
+  // Prepare the request body based on call type
+  let requestBody;
+  
+  if (CALL_TYPE === 'agent') {
+    // Agent-specific call configuration
+    requestBody = {
       metadata: {
         uuid: uuid,
-      },  
+      },
       medium: {
         serverWebSocket: {
           inputSampleRate: ULTRAVOX_SAMPLE_RATE,
@@ -50,7 +70,103 @@ async function connectToUltravox(uuid) {
           clientBufferSizeMs: ULTRAVOX_CLIENT_BUFFER_SIZE_MS,
         },
       },
-    },
+    };
+  } else {
+    // Generic call configuration
+    requestBody = {
+      systemPrompt: process.env.ULTRAVOX_SYSTEM_PROMPT || "You are a helpful AI assistant.",
+      temperature: parseFloat(process.env.ULTRAVOX_TEMPERATURE) || 0,
+      model: process.env.ULTRAVOX_MODEL || "fixie-ai/ultravox",
+      voice: process.env.ULTRAVOX_VOICE || "Shaun",
+      metadata: {
+        uuid: uuid,
+      },
+      medium: {
+        serverWebSocket: {
+          inputSampleRate: ULTRAVOX_SAMPLE_RATE,
+          outputSampleRate: ULTRAVOX_SAMPLE_RATE,
+          clientBufferSizeMs: ULTRAVOX_CLIENT_BUFFER_SIZE_MS,
+        },
+      },
+      recordingEnabled: process.env.ULTRAVOX_RECORDING_ENABLED === 'true' || false,
+      joinTimeout: process.env.ULTRAVOX_JOIN_TIMEOUT || "30s",
+      maxDuration: process.env.ULTRAVOX_MAX_DURATION || "3600s",
+    };
+
+    // Add external voice configuration if provided
+    if (process.env.ULTRAVOX_EXTERNAL_VOICE_PROVIDER) {
+      const voiceProvider = process.env.ULTRAVOX_EXTERNAL_VOICE_PROVIDER.toLowerCase();
+      
+      switch (voiceProvider) {
+        case 'elevenlabs':
+          requestBody.externalVoice = {
+            elevenLabs: {
+              voiceId: process.env.ULTRAVOX_ELEVENLABS_VOICE_ID,
+              model: process.env.ULTRAVOX_ELEVENLABS_MODEL || "eleven_monolingual_v1",
+              speed: parseFloat(process.env.ULTRAVOX_ELEVENLABS_SPEED) || 1.0,
+              useSpeakerBoost: process.env.ULTRAVOX_ELEVENLABS_USE_SPEAKER_BOOST === 'true' || true,
+            }
+          };
+          break;
+        case 'cartesia':
+          requestBody.externalVoice = {
+            cartesia: {
+              voiceId: process.env.ULTRAVOX_CARTESIA_VOICE_ID,
+              model: process.env.ULTRAVOX_CARTESIA_MODEL || "cartesia-1",
+              speed: parseFloat(process.env.ULTRAVOX_CARTESIA_SPEED) || 1.0,
+            }
+          };
+          break;
+        case 'lmnt':
+          requestBody.externalVoice = {
+            lmnt: {
+              voiceId: process.env.ULTRAVOX_LMNT_VOICE_ID,
+              model: process.env.ULTRAVOX_LMNT_MODEL || "lmnt-1",
+              speed: parseFloat(process.env.ULTRAVOX_LMNT_SPEED) || 1.0,
+              conversational: process.env.ULTRAVOX_LMNT_CONVERSATIONAL === 'true' || true,
+            }
+          };
+          break;
+        case 'generic':
+          requestBody.externalVoice = {
+            generic: {
+              url: process.env.ULTRAVOX_GENERIC_VOICE_URL,
+              headers: JSON.parse(process.env.ULTRAVOX_GENERIC_VOICE_HEADERS || '{}'),
+              body: JSON.parse(process.env.ULTRAVOX_GENERIC_VOICE_BODY || '{}'),
+              responseSampleRate: parseInt(process.env.ULTRAVOX_GENERIC_VOICE_SAMPLE_RATE) || 24000,
+              responseWordsPerMinute: parseInt(process.env.ULTRAVOX_GENERIC_VOICE_WPM) || 150,
+              responseMimeType: process.env.ULTRAVOX_GENERIC_VOICE_MIME_TYPE || "audio/wav",
+              jsonAudioFieldPath: process.env.ULTRAVOX_GENERIC_VOICE_AUDIO_FIELD || "audio",
+            }
+          };
+          break;
+      }
+    }
+
+    // Add selected tools if provided
+    if (process.env.ULTRAVOX_SELECTED_TOOLS) {
+      try {
+        requestBody.selectedTools = JSON.parse(process.env.ULTRAVOX_SELECTED_TOOLS);
+      } catch (error) {
+        console.warn("Invalid ULTRAVOX_SELECTED_TOOLS JSON format:", error.message);
+      }
+    }
+
+    // Add VAD settings if provided
+    if (process.env.ULTRAVOX_VAD_SETTINGS) {
+      try {
+        requestBody.vadSettings = JSON.parse(process.env.ULTRAVOX_VAD_SETTINGS);
+      } catch (error) {
+        console.warn("Invalid ULTRAVOX_VAD_SETTINGS JSON format:", error.message);
+      }
+    }
+  }
+
+  console.log("Request body:", requestBody);
+
+  const response = await axios.post(
+    apiUrl,
+    requestBody,
     {
       headers: {
         "Content-Type": "application/json",
@@ -58,6 +174,8 @@ async function connectToUltravox(uuid) {
       },
     }
   );
+
+  console.log("Response:", response.data);
 
   const joinUrl = response.data.joinUrl;
   if (!joinUrl) {
@@ -102,7 +220,7 @@ const handleAudioStream = async (req, res) => {
       ultravoxChunksQueue = Buffer.concat([ultravoxChunksQueue, data]);
 
       // If we have accumulated enough time, write the buffer
-      if (ultravoxStartTime && Date.now() - ultravoxStartTime >= 100) {
+      if (ultravoxStartTime && Date.now() - ultravoxStartTime >= 100 && ultravoxChunksQueue.length >= 320) {
         // Create a copy of the current buffer and reset the original
         const bufferToWrite = ultravoxChunksQueue;
         ultravoxChunksQueue = Buffer.alloc(0);
@@ -172,7 +290,6 @@ const handleAudioStream = async (req, res) => {
 
   req.on("error", (err) => {
     console.error("Request error:", err);
-    clearInterval(interval);
     ultravoxWebSocket.close();
   });
 };
