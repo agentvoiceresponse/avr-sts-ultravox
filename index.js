@@ -1,21 +1,23 @@
 /**
  * index.js
- * Entry point for the Ultravox Speech-to-Speech streaming application.
+ * Entry point for the Ultravox Speech-to-Speech streaming WebSocket server.
  * This server handles real-time audio streaming between clients and Ultravox's API,
  * performing necessary audio format conversions and WebSocket communication.
  * Supports both agent-specific calls and generic calls.
+ *
+ * Client Protocol:
+ * - Send {"type": "init", "uuid": "uuid"} to initialize session
+ * - Send {"type": "audio", "audio": "base64_encoded_audio"} to stream audio
+ * - Receive {"type": "audio", "audio": "base64_encoded_audio"} for responses
+ * - Receive {"type": "error", "message": "error_message"} for errors
  *
  * @author Agent Voice Response <info@agentvoiceresponse.com>
  * @see https://www.agentvoiceresponse.com
  */
 
-const express = require("express");
-const axios = require("axios");
 const WebSocket = require("ws");
+const axios = require("axios");
 require("dotenv").config();
-
-// Initialize Express application
-const app = express();
 
 // Configuration for call type
 const CALL_TYPE = process.env.ULTRAVOX_CALL_TYPE || 'agent'; // 'agent' or 'generic'
@@ -186,118 +188,191 @@ async function connectToUltravox(uuid) {
 }
 
 /**
- * Handles incoming client audio stream and manages communication with Ultravox's API.
+ * Handles incoming client WebSocket connection and manages communication with Ultravox's API.
  * Implements buffering for audio chunks received before WebSocket connection is established.
  *
- * @param {Request} req - Express request object
- * @param {Response} res - Express response object
+ * @param {WebSocket} clientWs - Client WebSocket connection
  */
-const handleAudioStream = async (req, res) => {
-  const uuid = req.headers['x-uuid'];
-  console.log('Received UUID:', uuid);
-  
-  const ultravoxWebSocket = await connectToUltravox(uuid);
+const handleClientConnection = (clientWs) => {
+  console.log("New client WebSocket connection received");
+  let sessionUuid = null;
+  let ultravoxWebSocket = null;
 
-  ultravoxWebSocket.on("open", () => {
-    console.log("WebSocket connected to Ultravox");
-  });
-
-  let ultravoxChunksQueue = Buffer.alloc(0);
-  let isFirstUltravoxChunk = true;
   let ultravoxStartTime = null;
 
-
-  ultravoxWebSocket.on("message", async (data, isBinary) => {
-    if (isBinary) {
-      // Handle binary audio data from Ultravox
-      if (isFirstUltravoxChunk) {
-        ultravoxStartTime = Date.now();
-        isFirstUltravoxChunk = false;
-        console.log("First Ultravox audio chunk received, starting delay...");
-      }
-
-      // Add Ultravox chunk to buffer
-      ultravoxChunksQueue = Buffer.concat([ultravoxChunksQueue, data]);
-
-      // If we have accumulated enough time, write the buffer
-      if (ultravoxStartTime && Date.now() - ultravoxStartTime >= 100 && ultravoxChunksQueue.length >= 320) {
-        // Create a copy of the current buffer and reset the original
-        const bufferToWrite = ultravoxChunksQueue;
-        ultravoxChunksQueue = Buffer.alloc(0);
-        
-        // Write the buffer to the response
-        res.write(bufferToWrite);
-      }
-    } else {
-      // Handle JSON control messages from Ultravox
-      const message = JSON.parse(data.toString());
-
+  // Handle client WebSocket messages
+  clientWs.on("message", (data) => {
+    try {
+      const message = JSON.parse(data);
       switch (message.type) {
-        case "call_started":
-          console.log("Call started", message.callId);
+        case "init":
+          sessionUuid = message.uuid;
+          console.log("Session UUID:", sessionUuid);
+          // Initialize Ultravox connection when client is ready
+          initializeUltravoxConnection();
           break;
 
-        case "state":
-          console.log("State", message.state);
-          break;
-
-        case "transcript":
-          if (message.final) {
-            console.log(
-              `${message.role.toUpperCase()} (${message.medium}): ${
-                message.text
-              }`
-            );
+        case "audio":
+          // Handle audio data from client
+          if (message.audio && ultravoxWebSocket && ultravoxWebSocket.readyState === WebSocket.OPEN) {
+            const audioBuffer = Buffer.from(message.audio, "base64");
+            ultravoxWebSocket.send(audioBuffer);
           }
           break;
 
-        case "playback_clear_buffer":
-          console.log("Playback clear buffer");
-          break;
-
-        case "error":
-          console.error("Error", message);
-          break;
-
         default:
-          console.log("Received message type:", message.type);
+          console.log("Unknown message type from client:", message.type);
           break;
       }
+    } catch (error) {
+      console.error("Error processing client message:", error);
     }
   });
 
-  ultravoxWebSocket.on("close", () => {
-    console.log("WebSocket connection closed");
-    res.end();
-  });
+  // Initialize Ultravox WebSocket connection
+  const initializeUltravoxConnection = async () => {
+    try {
+      ultravoxWebSocket = await connectToUltravox(sessionUuid);
 
-  ultravoxWebSocket.on("error", (err) => {
-    console.error("WebSocket error:", err);
-    res.end();
-  });
+      ultravoxWebSocket.on("open", () => {
+        console.log("WebSocket connected to Ultravox");
+      });
 
-  // Handle incoming audio data from client
-  req.on("data", async (audioChunk) => {
-    if (ultravoxWebSocket.readyState === ultravoxWebSocket.OPEN) {
-      ultravoxWebSocket.send(audioChunk);
+      ultravoxWebSocket.on("message", async (data, isBinary) => {
+        if (isBinary) {
+          // Handle binary audio data from Ultravox
+          clientWs.send(
+            JSON.stringify({
+              type: "audio",
+              audio: data.toString("base64"),
+            })
+          );
+        } else {
+          // Handle JSON control messages from Ultravox
+          const message = JSON.parse(data.toString());
+
+          switch (message.type) {
+            case "call_started":
+              console.log("Call started", message.callId);
+              break;
+
+            case "state":
+              console.log("State", message.state);
+              if (message.state === "listening") {
+                clientWs.send(
+                  JSON.stringify({
+                    type: "interruption",
+                  })
+                );
+              }
+              break;
+
+            case "transcript":
+              if (message.final) {
+                console.log(
+                  `${message.role.toUpperCase()} (${message.medium}): ${
+                    message.text
+                  }`
+                );
+                // Send transcript to client
+                clientWs.send(
+                  JSON.stringify({
+                    type: "transcript",
+                    role: message.role,
+                    text: message.text,
+                  })
+                );
+              }
+              break;
+
+            case "playback_clear_buffer":
+              console.log("Playback clear buffer");
+              break;
+
+            case "error":
+              console.error("Error", message);
+              clientWs.send(
+                JSON.stringify({
+                  type: "error",
+                  message: message.message || "Unknown error occurred",
+                })
+              );
+              break;
+
+            default:
+              console.log("Received message type:", message.type);
+              break;
+          }
+        }
+      });
+
+      ultravoxWebSocket.on("close", () => {
+        console.log("Ultravox WebSocket connection closed");
+        cleanup();
+      });
+
+      ultravoxWebSocket.on("error", (err) => {
+        console.error("Ultravox WebSocket error:", err);
+        clientWs.send(
+          JSON.stringify({
+            type: "error",
+            message: "Connection to Ultravox failed",
+          })
+        );
+        cleanup();
+      });
+    } catch (error) {
+      console.error("Error initializing Ultravox connection:", error);
+      clientWs.send(
+        JSON.stringify({
+          type: "error",
+          message: "Failed to connect to Ultravox",
+        })
+      );
+      cleanup();
     }
+  };
+
+  // Handle client WebSocket close
+  clientWs.on("close", () => {
+    console.log("Client WebSocket connection closed");
+    cleanup();
   });
 
-  req.on("end", () => {
-    console.log("Request stream ended");
-    ultravoxWebSocket.close();
+  clientWs.on("error", (err) => {
+    console.error("Client WebSocket error:", err);
+    cleanup();
   });
 
-  req.on("error", (err) => {
-    console.error("Request error:", err);
-    ultravoxWebSocket.close();
-  });
+  /**
+   * Cleans up resources and closes connections.
+   */
+  function cleanup() {
+    if (ultravoxWebSocket) ultravoxWebSocket.close();
+    if (clientWs) clientWs.close();
+  }
 };
 
-// Route for speech-to-speech streaming
-app.post("/speech-to-speech-stream", handleAudioStream);
+// Start WebSocket server
+const startServer = async () => {
+  try {
+    // Create WebSocket server
+    const PORT = process.env.PORT || 6031;
+    const wss = new WebSocket.Server({ port: PORT });
 
-const PORT = process.env.PORT || 6031;
-app.listen(PORT, async () => {
-  console.log(`Ultravox Speech-to-Speech server running on port ${PORT}`);
-});
+    wss.on("connection", (clientWs) => {
+      console.log("New client connected");
+      handleClientConnection(clientWs);
+    });
+
+    console.log(
+      `Ultravox Speech-to-Speech WebSocket server running on port ${PORT}`
+    );
+  } catch (error) {
+    console.error("Failed to start server:", error);
+    process.exit(1);
+  }
+};
+
+// Start the server
+startServer();
