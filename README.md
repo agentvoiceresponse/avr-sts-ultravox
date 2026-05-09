@@ -32,7 +32,6 @@ Copy `.env.example` to `.env` and configure the following variables:
 
 #### Agent-specific Configuration (when CALL_TYPE=agent)
 - `ULTRAVOX_AGENT_ID`: Your Ultravox agent ID (required)
-- `ULTRAVOX_TOOL_OVERRIDES`: JSON object overriding the agent tool set (`add`, `remove`, `removeAll` per [Ultravox agent calls API](https://docs.ultravox.ai/api-reference/agents/agents-calls-post))
 
 #### Generic Call Configuration (when CALL_TYPE=generic)
 - `ULTRAVOX_SYSTEM_PROMPT`: System prompt for the AI (default: "You are a helpful AI assistant.")
@@ -73,13 +72,23 @@ Set `ULTRAVOX_EXTERNAL_VOICE_PROVIDER` to one of: `elevenlabs`, `cartesia`, `lmn
 - `ULTRAVOX_GENERIC_VOICE_AUDIO_FIELD`: Audio field path (default: "audio")
 
 #### Advanced Configuration
-- `ULTRAVOX_SELECTED_TOOLS`: JSON array of selected tools for **generic** calls only (maps to Ultravox `selectedTools`)
-- `ULTRAVOX_TOOL_OVERRIDES`: JSON object for **agent** calls to add/remove tools for this session (maps to Ultravox `toolOverrides`)
+
+**Tools (same pattern as `avr-sts-openai`)**
+
+- Tool definitions live under **`avr_tools/`** (shipped defaults: `avr_hangup`, `avr_transfer`) and optionally **`tools/`** for your site-specific tools.
+- `loadTools.js` scans both directories at startup-style resolution (per require time when building the Ultravox payload).
+- At call creation, every loaded tool is registered with Ultravox as a **temporary client tool**:
+  - **Generic** calls → `selectedTools`
+  - **Agent** calls → `toolOverrides.add`
+- On each `client_tool_invocation`, the server resolves the tool with `getToolHandler(toolName)` (same as OpenAI STS), runs `handler(uuid, parameters)`, and sends `client_tool_result` on the Ultravox WebSocket. The session **`uuid`** comes from the client `init` message, matching the OpenAI integration.
+
 - `ULTRAVOX_VAD_SETTINGS`: JSON string of VAD settings (generic calls)
 
 #### Client tools (WebSocket protocol)
 
-When the model invokes a **client** or **data-connection** tool, Ultravox sends `client_tool_invocation` or `data_connection_tool_invocation`. This server forwards them to your client as:
+When the model invokes an **AVR** client tool (`avr_hangup`, `avr_transfer`, or custom entries in `tools/`), this server runs the handler **locally** (same pattern as OpenAI STS) and sends `client_tool_result` back on the Ultravox WebSocket—no client round-trip required for telephony-style integrations.
+
+For other client tools, Ultravox sends `client_tool_invocation` or `data_connection_tool_invocation`. This server forwards them to your client as:
 
 ```json
 { "type": "tool_invocation", "toolName": "...", "invocationId": "...", "parameters": {} }

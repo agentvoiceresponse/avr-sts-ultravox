@@ -19,47 +19,88 @@
 
 const WebSocket = require("ws");
 const axios = require("axios");
+const { loadTools, getToolHandler } = require("./loadTools");
+
 require("dotenv").config();
 
 /**
- * Parses a JSON env value that must be an array (e.g. selectedTools list).
- * @param {string|undefined} raw
- * @param {string} envName
- * @returns {unknown[]|null}
+ * Maps an OpenAI-style JSON Schema (function parameters) to Ultravox dynamicParameters.
+ * @param {Record<string, unknown>|undefined} schema
+ * @returns {Array<Record<string, unknown>>}
  */
-function parseJsonEnvArray(raw, envName) {
-  if (!raw) return null;
-  try {
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) {
-      throw new Error("value must be a JSON array");
-    }
-    return parsed;
-  } catch (e) {
-    console.warn(`Invalid ${envName}:`, e.message);
-    return null;
-  }
+function jsonSchemaToDynamicParameters(schema) {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return [];
+  const props =
+    schema.properties && typeof schema.properties === "object"
+      ? schema.properties
+      : {};
+  const required = new Set(
+    Array.isArray(schema.required) ? schema.required : []
+  );
+  return Object.entries(props).map(([name, propSchema]) => ({
+    name,
+    location: "PARAMETER_LOCATION_BODY",
+    schema: propSchema,
+    required: required.has(name),
+  }));
 }
 
 /**
- * Parses ToolOverrides object for agent calls (add / remove / removeAll).
- * @param {string|undefined} raw
- * @returns {Record<string, unknown>|null}
+ * Converts tools from loadTools() into Ultravox selectedTools entries (temporary client tools).
+ * @returns {Array<Record<string, unknown>>}
  */
-function parseToolOverridesEnv(raw) {
-  if (!raw) return null;
+function avrToolsAsUltravoxSelectedTools() {
+  const tools = loadTools();
+  return tools.map((t) => ({
+    temporaryTool: {
+      modelToolName: t.name,
+      description: t.description || "",
+      dynamicParameters: jsonSchemaToDynamicParameters(t.parameters),
+      client: {},
+    },
+  }));
+}
+
+/** @returns {Array<Record<string, unknown>>|null} */
+function buildGenericSelectedTools() {
   try {
-    const parsed = JSON.parse(raw);
-    if (
-      parsed === null ||
-      typeof parsed !== "object" ||
-      Array.isArray(parsed)
-    ) {
-      throw new Error("value must be a JSON object");
+    const avr = avrToolsAsUltravoxSelectedTools();
+    if (avr.length) {
+      console.log(
+        `Registering ${avr.length} AVR tool(s) from avr_tools/tools (Ultravox selectedTools)`
+      );
+      return avr;
     }
-    return parsed;
   } catch (e) {
-    console.warn("Invalid ULTRAVOX_TOOL_OVERRIDES:", e.message);
+    console.warn("Could not load AVR tools for generic call:", e.message);
+  }
+  return null;
+}
+
+/** @returns {Record<string, unknown>|null} */
+function buildAgentToolOverrides() {
+  try {
+    const add = avrToolsAsUltravoxSelectedTools();
+    if (add.length) {
+      console.log(
+        `Registering ${add.length} AVR tool(s) from avr_tools/tools (Ultravox toolOverrides.add)`
+      );
+      return { add };
+    }
+  } catch (e) {
+    console.warn("Could not load AVR tools for agent call:", e.message);
+  }
+  return null;
+}
+
+/**
+ * @param {string} toolName
+ * @returns {((uuid: string, args: object) => Promise<unknown>)|null}
+ */
+function tryGetToolHandler(toolName) {
+  try {
+    return getToolHandler(toolName);
+  } catch {
     return null;
   }
 }
@@ -151,7 +192,7 @@ async function connectToUltravox(uuid) {
       },
     };
 
-    const toolOverrides = parseToolOverridesEnv(process.env.ULTRAVOX_TOOL_OVERRIDES);
+    const toolOverrides = buildAgentToolOverrides();
     if (toolOverrides) {
       requestBody.toolOverrides = toolOverrides;
     }
@@ -227,13 +268,9 @@ async function connectToUltravox(uuid) {
       }
     }
 
-    // Add selected tools if provided (generic calls — see Ultravox selectedTools field)
-    const selectedToolsArr = parseJsonEnvArray(
-      process.env.ULTRAVOX_SELECTED_TOOLS,
-      "ULTRAVOX_SELECTED_TOOLS"
-    );
-    if (selectedToolsArr) {
-      requestBody.selectedTools = selectedToolsArr;
+    const selectedFromDisk = buildGenericSelectedTools();
+    if (selectedFromDisk) {
+      requestBody.selectedTools = selectedFromDisk;
     }
 
     // Add VAD settings if provided
@@ -393,16 +430,63 @@ const handleClientConnection = (clientWs) => {
               console.log("Playback clear buffer");
               break;
 
-            case "client_tool_invocation":
-              clientWs.send(
-                JSON.stringify({
-                  type: "tool_invocation",
-                  toolName: message.toolName,
-                  invocationId: message.invocationId,
-                  parameters: message.parameters ?? {},
-                })
-              );
+            case "client_tool_invocation": {
+              const params = message.parameters ?? {};
+              const handler = tryGetToolHandler(message.toolName);
+              if (
+                handler &&
+                ultravoxWebSocket &&
+                ultravoxWebSocket.readyState === WebSocket.OPEN
+              ) {
+                try {
+                  const resultContent = await handler(sessionUuid, params);
+                  const resultStr =
+                    typeof resultContent === "string"
+                      ? resultContent
+                      : JSON.stringify(resultContent);
+                  ultravoxWebSocket.send(
+                    JSON.stringify({
+                      type: "client_tool_result",
+                      invocationId: message.invocationId,
+                      result: resultStr,
+                    })
+                  );
+                  clientWs.send(
+                    JSON.stringify({
+                      type: "tool_invocation",
+                      toolName: message.toolName,
+                      invocationId: message.invocationId,
+                      parameters: params,
+                      serverHandled: true,
+                    })
+                  );
+                } catch (err) {
+                  console.error(
+                    `Error executing AVR tool ${message.toolName}:`,
+                    err
+                  );
+                  ultravoxWebSocket.send(
+                    JSON.stringify({
+                      type: "client_tool_result",
+                      invocationId: message.invocationId,
+                      errorType: "implementation-error",
+                      errorMessage:
+                        err instanceof Error ? err.message : String(err),
+                    })
+                  );
+                }
+              } else {
+                clientWs.send(
+                  JSON.stringify({
+                    type: "tool_invocation",
+                    toolName: message.toolName,
+                    invocationId: message.invocationId,
+                    parameters: params,
+                  })
+                );
+              }
               break;
+            }
 
             case "data_connection_tool_invocation":
               clientWs.send(
