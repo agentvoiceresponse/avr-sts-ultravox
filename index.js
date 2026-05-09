@@ -32,6 +32,15 @@ const AVR_TOOL_EXECUTION_TIMEOUT_MS = (() => {
   return Number.isFinite(raw) && raw > 0 ? raw : amiMs + 2000;
 })();
 
+/** Timeout for Ultravox REST `POST …/calls` that returns joinUrl (default 60s). */
+const ULTRAVOX_JOIN_HTTP_TIMEOUT_MS = (() => {
+  const raw = parseInt(
+    process.env.ULTRAVOX_JOIN_HTTP_TIMEOUT_MS || "60000",
+    10
+  );
+  return Number.isFinite(raw) && raw > 0 ? raw : 60000;
+})();
+
 /**
  * Maps an OpenAI-style JSON Schema (function parameters) to Ultravox dynamicParameters.
  * @param {Record<string, unknown>|undefined} schema
@@ -186,6 +195,20 @@ function sendUltravoxJson(ultravoxWebSocket, payload) {
   }
 }
 
+function sendClientJson(clientWs, payload) {
+  if (!clientWs || clientWs.readyState !== WebSocket.OPEN) {
+    console.warn("Cannot send to client: WebSocket not open", payload?.type);
+    return false;
+  }
+  try {
+    clientWs.send(JSON.stringify(payload));
+    return true;
+  } catch (err) {
+    console.error("Failed sending to client:", err?.message ?? err);
+    return false;
+  }
+}
+
 /**
  * Runs a registered disk tool server-side and always attempts an Ultravox tool result envelope.
  * @param {object} opts
@@ -214,15 +237,13 @@ async function executeToolAndSendUltravoxResult(opts) {
     !ultravoxWebSocket ||
     ultravoxWebSocket.readyState !== WebSocket.OPEN
   ) {
-    clientWs.send(
-      JSON.stringify({
-        type: "tool_invocation",
-        ...(channel === "data_connection" ? { source: "data_connection" } : {}),
-        toolName,
-        invocationId,
-        parameters,
-      })
-    );
+    sendClientJson(clientWs, {
+      type: "tool_invocation",
+      ...(channel === "data_connection" ? { source: "data_connection" } : {}),
+      toolName,
+      invocationId,
+      parameters,
+    });
     return;
   }
 
@@ -246,16 +267,14 @@ async function executeToolAndSendUltravoxResult(opts) {
       invocationId,
       result: resultStr,
     });
-    clientWs.send(
-      JSON.stringify({
-        type: "tool_invocation",
-        ...(channel === "data_connection" ? { source: "data_connection" } : {}),
-        toolName,
-        invocationId,
-        parameters,
-        serverHandled: true,
-      })
-    );
+    sendClientJson(clientWs, {
+      type: "tool_invocation",
+      ...(channel === "data_connection" ? { source: "data_connection" } : {}),
+      toolName,
+      invocationId,
+      parameters,
+      serverHandled: true,
+    });
   } catch (err) {
     console.error(`Error executing AVR tool ${toolName}:`, err);
     sendUltravoxJson(ultravoxWebSocket, {
@@ -419,6 +438,7 @@ async function connectToUltravox(uuid) {
     apiUrl,
     requestBody,
     {
+      timeout: ULTRAVOX_JOIN_HTTP_TIMEOUT_MS,
       headers: {
         "Content-Type": "application/json",
         "X-API-Key": process.env.ULTRAVOX_API_KEY,
@@ -520,7 +540,16 @@ const handleClientConnection = (clientWs) => {
           );
         } else {
           // Handle JSON control messages from Ultravox
-          const message = JSON.parse(data.toString());
+          let message;
+          try {
+            message = JSON.parse(data.toString());
+          } catch (parseErr) {
+            console.error(
+              "Invalid JSON from Ultravox:",
+              parseErr?.message ?? parseErr
+            );
+            return;
+          }
 
           switch (message.type) {
             case "call_started":
