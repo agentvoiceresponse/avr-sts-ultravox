@@ -32,6 +32,7 @@ Copy `.env.example` to `.env` and configure the following variables:
 
 #### Agent-specific Configuration (when CALL_TYPE=agent)
 - `ULTRAVOX_AGENT_ID`: Your Ultravox agent ID (required)
+- `ULTRAVOX_TOOL_OVERRIDES`: JSON object overriding the agent tool set (`add`, `remove`, `removeAll` per [Ultravox agent calls API](https://docs.ultravox.ai/api-reference/agents/agents-calls-post))
 
 #### Generic Call Configuration (when CALL_TYPE=generic)
 - `ULTRAVOX_SYSTEM_PROMPT`: System prompt for the AI (default: "You are a helpful AI assistant.")
@@ -72,8 +73,34 @@ Set `ULTRAVOX_EXTERNAL_VOICE_PROVIDER` to one of: `elevenlabs`, `cartesia`, `lmn
 - `ULTRAVOX_GENERIC_VOICE_AUDIO_FIELD`: Audio field path (default: "audio")
 
 #### Advanced Configuration
-- `ULTRAVOX_SELECTED_TOOLS`: JSON string of tools to use
-- `ULTRAVOX_VAD_SETTINGS`: JSON string of VAD settings
+- `ULTRAVOX_SELECTED_TOOLS`: JSON array of selected tools for **generic** calls only (maps to Ultravox `selectedTools`)
+- `ULTRAVOX_TOOL_OVERRIDES`: JSON object for **agent** calls to add/remove tools for this session (maps to Ultravox `toolOverrides`)
+- `ULTRAVOX_VAD_SETTINGS`: JSON string of VAD settings (generic calls)
+
+#### Client tools (WebSocket protocol)
+
+When the model invokes a **client** or **data-connection** tool, Ultravox sends `client_tool_invocation` or `data_connection_tool_invocation`. This server forwards them to your client as:
+
+```json
+{ "type": "tool_invocation", "toolName": "...", "invocationId": "...", "parameters": {} }
+```
+
+For data-connection tools, the payload also includes `"source": "data_connection"`.
+
+Reply with a **tool result** on the same WebSocket (while the Ultravox session is open):
+
+```json
+{
+  "type": "tool_result",
+  "invocationId": "<same as invocation>",
+  "result": "string or structured result for the model",
+  "responseType": "tool-response",
+  "agentReaction": "speaks",
+  "source": "data_connection"
+}
+```
+
+Omit `source` (or set `"client"`) for normal client tools. On failure, send `errorType` (e.g. `implementation-error`) and `errorMessage` instead of `result`. See [Ultravox data messages](https://docs.ultravox.ai/apps/datamessages#clienttoolresult-and-dataconnectiontoolresult).
 
 ## Usage
 

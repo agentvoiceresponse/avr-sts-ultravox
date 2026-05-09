@@ -8,7 +8,9 @@
  * Client Protocol:
  * - Send {"type": "init", "uuid": "uuid"} to initialize session
  * - Send {"type": "audio", "audio": "base64_encoded_audio"} to stream audio
+ * - Send {"type": "tool_result", "invocationId": "...", "result": "..."} after handling a tool_invocation (optional: responseType, agentReaction, source, errors)
  * - Receive {"type": "audio", "audio": "base64_encoded_audio"} for responses
+ * - Receive {"type": "tool_invocation", "toolName", "invocationId", "parameters", "source?"} for Ultravox client/data-connection tools
  * - Receive {"type": "error", "message": "error_message"} for errors
  *
  * @author Agent Voice Response <info@agentvoiceresponse.com>
@@ -18,6 +20,81 @@
 const WebSocket = require("ws");
 const axios = require("axios");
 require("dotenv").config();
+
+/**
+ * Parses a JSON env value that must be an array (e.g. selectedTools list).
+ * @param {string|undefined} raw
+ * @param {string} envName
+ * @returns {unknown[]|null}
+ */
+function parseJsonEnvArray(raw, envName) {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      throw new Error("value must be a JSON array");
+    }
+    return parsed;
+  } catch (e) {
+    console.warn(`Invalid ${envName}:`, e.message);
+    return null;
+  }
+}
+
+/**
+ * Parses ToolOverrides object for agent calls (add / remove / removeAll).
+ * @param {string|undefined} raw
+ * @returns {Record<string, unknown>|null}
+ */
+function parseToolOverridesEnv(raw) {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (
+      parsed === null ||
+      typeof parsed !== "object" ||
+      Array.isArray(parsed)
+    ) {
+      throw new Error("value must be a JSON object");
+    }
+    return parsed;
+  } catch (e) {
+    console.warn("Invalid ULTRAVOX_TOOL_OVERRIDES:", e.message);
+    return null;
+  }
+}
+
+/**
+ * Builds a client_tool_result or data_connection_tool_result message for Ultravox.
+ * @param {Record<string, unknown>} message Parsed client message (type tool_result).
+ * @returns {Record<string, unknown>}
+ */
+function buildUltravoxToolResultPayload(message) {
+  const source = message.source;
+  const ultravoxType =
+    source === "data_connection"
+      ? "data_connection_tool_result"
+      : "client_tool_result";
+
+  const payload = {
+    type: ultravoxType,
+    invocationId: message.invocationId,
+  };
+
+  if (message.errorType) {
+    payload.errorType = message.errorType;
+    if (message.errorMessage != null) payload.errorMessage = message.errorMessage;
+    return payload;
+  }
+
+  if (message.result !== undefined) payload.result = message.result;
+  if (message.responseType != null) payload.responseType = message.responseType;
+  if (message.agentReaction != null) payload.agentReaction = message.agentReaction;
+  if (message.updateCallState !== undefined)
+    payload.updateCallState = message.updateCallState;
+
+  return payload;
+}
 
 // Configuration for call type
 const CALL_TYPE = process.env.ULTRAVOX_CALL_TYPE || 'agent'; // 'agent' or 'generic'
@@ -73,6 +150,11 @@ async function connectToUltravox(uuid) {
         },
       },
     };
+
+    const toolOverrides = parseToolOverridesEnv(process.env.ULTRAVOX_TOOL_OVERRIDES);
+    if (toolOverrides) {
+      requestBody.toolOverrides = toolOverrides;
+    }
   } else {
     // Generic call configuration
     requestBody = {
@@ -145,13 +227,13 @@ async function connectToUltravox(uuid) {
       }
     }
 
-    // Add selected tools if provided
-    if (process.env.ULTRAVOX_SELECTED_TOOLS) {
-      try {
-        requestBody.selectedTools = JSON.parse(process.env.ULTRAVOX_SELECTED_TOOLS);
-      } catch (error) {
-        console.warn("Invalid ULTRAVOX_SELECTED_TOOLS JSON format:", error.message);
-      }
+    // Add selected tools if provided (generic calls — see Ultravox selectedTools field)
+    const selectedToolsArr = parseJsonEnvArray(
+      process.env.ULTRAVOX_SELECTED_TOOLS,
+      "ULTRAVOX_SELECTED_TOOLS"
+    );
+    if (selectedToolsArr) {
+      requestBody.selectedTools = selectedToolsArr;
     }
 
     // Add VAD settings if provided
@@ -220,6 +302,28 @@ const handleClientConnection = (clientWs) => {
           }
           break;
 
+        case "tool_result": {
+          if (
+            ultravoxWebSocket &&
+            ultravoxWebSocket.readyState === WebSocket.OPEN &&
+            typeof message.invocationId === "string"
+          ) {
+            const toolPayload = buildUltravoxToolResultPayload(message);
+            ultravoxWebSocket.send(JSON.stringify(toolPayload));
+          } else if (!message.invocationId) {
+            console.warn("tool_result ignored: missing invocationId");
+          } else {
+            console.warn("tool_result ignored: Ultravox socket not ready");
+            clientWs.send(
+              JSON.stringify({
+                type: "error",
+                message: "Cannot forward tool_result: Ultravox connection not ready",
+              })
+            );
+          }
+          break;
+        }
+
         default:
           console.log("Unknown message type from client:", message.type);
           break;
@@ -287,6 +391,29 @@ const handleClientConnection = (clientWs) => {
 
             case "playback_clear_buffer":
               console.log("Playback clear buffer");
+              break;
+
+            case "client_tool_invocation":
+              clientWs.send(
+                JSON.stringify({
+                  type: "tool_invocation",
+                  toolName: message.toolName,
+                  invocationId: message.invocationId,
+                  parameters: message.parameters ?? {},
+                })
+              );
+              break;
+
+            case "data_connection_tool_invocation":
+              clientWs.send(
+                JSON.stringify({
+                  type: "tool_invocation",
+                  source: "data_connection",
+                  toolName: message.toolName,
+                  invocationId: message.invocationId,
+                  parameters: message.parameters ?? {},
+                })
+              );
               break;
 
             case "error":
