@@ -18,6 +18,7 @@ COPY --chown=node:node --from=development /usr/src/app/node_modules ./node_modul
 
 COPY --chown=node:node loadTools.js ./
 COPY --chown=node:node avr_tools ./avr_tools
+COPY --chown=node:node tools ./tools
 COPY --chown=node:node index.js ./
 
 USER node

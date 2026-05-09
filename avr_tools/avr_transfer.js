@@ -1,7 +1,12 @@
-
 require("dotenv").config();
 
 const axios = require("axios");
+
+/** @returns {number} */
+function amiRequestTimeoutMs() {
+  const raw = parseInt(process.env.AMI_REQUEST_TIMEOUT_MS || "10000", 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : 10000;
+}
 
 module.exports = {
   name: "avr_transfer",
@@ -31,19 +36,33 @@ module.exports = {
     console.log("Transfering call to:", transfer_extension);
     console.log("UUID:", uuid);
 
+    const url = process.env.AMI_URL || "http://127.0.0.1:6006";
+    const timeout = amiRequestTimeoutMs();
     try {
-      const url = process.env.AMI_URL || "http://127.0.0.1:6006";
-      const res = await axios.post(`${url}/transfer`, {
-        uuid,
-        exten: transfer_extension,
-        context: transfer_context || "demo",
-        priority: transfer_priority || 1,
-      });
+      const res = await axios.post(
+        `${url}/transfer`,
+        {
+          uuid,
+          exten: transfer_extension,
+          context: transfer_context || "demo",
+          priority: transfer_priority || 1,
+        },
+        { timeout }
+      );
       console.log("Transfer response:", res.data);
-      return res.data.message;
+      if (typeof res.data?.message !== "undefined") return res.data.message;
+      return "OK";
     } catch (error) {
-      console.error("Error during transfer:", error.message);
-      return `Error during transfer: ${error.message}`;
+      const msg =
+        error?.code === "ECONNABORTED"
+          ? `AMI transfer timed out after ${timeout}ms`
+          : typeof axios.isAxiosError === "function" && axios.isAxiosError(error)
+            ? error.response?.data?.message || error.message
+            : error instanceof Error
+              ? error.message
+              : String(error);
+      console.error("Error during transfer:", msg);
+      throw new Error(msg);
     }
   },
 };

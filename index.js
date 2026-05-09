@@ -23,6 +23,15 @@ const { loadTools, getToolHandler } = require("./loadTools");
 
 require("dotenv").config();
 
+/** Upper bound for inline server tool handlers (default: AMI_REQUEST_TIMEOUT_MS + 2s). */
+const AVR_TOOL_EXECUTION_TIMEOUT_MS = (() => {
+  const amiDefault = parseInt(process.env.AMI_REQUEST_TIMEOUT_MS || "10000", 10);
+  const amiMs =
+    Number.isFinite(amiDefault) && amiDefault > 0 ? amiDefault : 10000;
+  const raw = parseInt(process.env.AVR_TOOL_EXECUTION_TIMEOUT_MS || "", 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : amiMs + 2000;
+})();
+
 /**
  * Maps an OpenAI-style JSON Schema (function parameters) to Ultravox dynamicParameters.
  * @param {Record<string, unknown>|undefined} schema
@@ -135,6 +144,123 @@ function buildUltravoxToolResultPayload(message) {
     payload.updateCallState = message.updateCallState;
 
   return payload;
+}
+
+/**
+ * @template T
+ * @param {Promise<T>} promise
+ * @param {number} ms
+ * @param {string} label
+ * @returns {Promise<T>}
+ */
+function promiseWithTimeout(promise, ms, label) {
+  if (!Number.isFinite(ms) || ms <= 0) return promise;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
+    ),
+  ]);
+}
+
+/**
+ * @param {WebSocket} ultravoxWebSocket
+ * @param {Record<string, unknown>} payload
+ * @returns {boolean}
+ */
+function sendUltravoxJson(ultravoxWebSocket, payload) {
+  if (!ultravoxWebSocket || ultravoxWebSocket.readyState !== WebSocket.OPEN) {
+    console.warn("Cannot forward to Ultravox: WebSocket not open", payload?.type);
+    return false;
+  }
+  try {
+    ultravoxWebSocket.send(JSON.stringify(payload));
+    return true;
+  } catch (err) {
+    console.error("Failed sending to Ultravox:", err?.message ?? err);
+    return false;
+  }
+}
+
+/**
+ * Runs a registered disk tool server-side and always attempts an Ultravox tool result envelope.
+ * @param {object} opts
+ * @param {WebSocket|null} opts.ultravoxWebSocket
+ * @param {WebSocket} opts.clientWs
+ * @param {string|null} opts.sessionUuid
+ * @param {string} opts.toolName
+ * @param {unknown} opts.invocationId
+ * @param {Record<string, unknown>} opts.parameters
+ * @param {'client'|'data_connection'} opts.channel
+ */
+async function executeToolAndSendUltravoxResult(opts) {
+  const {
+    ultravoxWebSocket,
+    clientWs,
+    sessionUuid,
+    toolName,
+    invocationId,
+    parameters,
+    channel,
+  } = opts;
+
+  const handler = tryGetToolHandler(toolName);
+  if (
+    !handler ||
+    !ultravoxWebSocket ||
+    ultravoxWebSocket.readyState !== WebSocket.OPEN
+  ) {
+    clientWs.send(
+      JSON.stringify({
+        type: "tool_invocation",
+        ...(channel === "data_connection" ? { source: "data_connection" } : {}),
+        toolName,
+        invocationId,
+        parameters,
+      })
+    );
+    return;
+  }
+
+  const resultMessageType =
+    channel === "data_connection"
+      ? "data_connection_tool_result"
+      : "client_tool_result";
+
+  try {
+    const resultContent = await promiseWithTimeout(
+      handler(sessionUuid, parameters),
+      AVR_TOOL_EXECUTION_TIMEOUT_MS,
+      toolName
+    );
+    const resultStr =
+      typeof resultContent === "string"
+        ? resultContent
+        : JSON.stringify(resultContent);
+    sendUltravoxJson(ultravoxWebSocket, {
+      type: resultMessageType,
+      invocationId,
+      result: resultStr,
+    });
+    clientWs.send(
+      JSON.stringify({
+        type: "tool_invocation",
+        ...(channel === "data_connection" ? { source: "data_connection" } : {}),
+        toolName,
+        invocationId,
+        parameters,
+        serverHandled: true,
+      })
+    );
+  } catch (err) {
+    console.error(`Error executing AVR tool ${toolName}:`, err);
+    sendUltravoxJson(ultravoxWebSocket, {
+      type: resultMessageType,
+      invocationId,
+      errorType: "implementation-error",
+      errorMessage: err instanceof Error ? err.message : String(err),
+    });
+  }
 }
 
 // Configuration for call type
@@ -431,74 +557,30 @@ const handleClientConnection = (clientWs) => {
               break;
 
             case "client_tool_invocation": {
-              const params = message.parameters ?? {};
-              const handler = tryGetToolHandler(message.toolName);
-              if (
-                handler &&
-                ultravoxWebSocket &&
-                ultravoxWebSocket.readyState === WebSocket.OPEN
-              ) {
-                try {
-                  const resultContent = await handler(sessionUuid, params);
-                  const resultStr =
-                    typeof resultContent === "string"
-                      ? resultContent
-                      : JSON.stringify(resultContent);
-                  ultravoxWebSocket.send(
-                    JSON.stringify({
-                      type: "client_tool_result",
-                      invocationId: message.invocationId,
-                      result: resultStr,
-                    })
-                  );
-                  clientWs.send(
-                    JSON.stringify({
-                      type: "tool_invocation",
-                      toolName: message.toolName,
-                      invocationId: message.invocationId,
-                      parameters: params,
-                      serverHandled: true,
-                    })
-                  );
-                } catch (err) {
-                  console.error(
-                    `Error executing AVR tool ${message.toolName}:`,
-                    err
-                  );
-                  ultravoxWebSocket.send(
-                    JSON.stringify({
-                      type: "client_tool_result",
-                      invocationId: message.invocationId,
-                      errorType: "implementation-error",
-                      errorMessage:
-                        err instanceof Error ? err.message : String(err),
-                    })
-                  );
-                }
-              } else {
-                clientWs.send(
-                  JSON.stringify({
-                    type: "tool_invocation",
-                    toolName: message.toolName,
-                    invocationId: message.invocationId,
-                    parameters: params,
-                  })
-                );
-              }
+              await executeToolAndSendUltravoxResult({
+                ultravoxWebSocket,
+                clientWs,
+                sessionUuid,
+                toolName: message.toolName,
+                invocationId: message.invocationId,
+                parameters: message.parameters ?? {},
+                channel: "client",
+              });
               break;
             }
 
-            case "data_connection_tool_invocation":
-              clientWs.send(
-                JSON.stringify({
-                  type: "tool_invocation",
-                  source: "data_connection",
-                  toolName: message.toolName,
-                  invocationId: message.invocationId,
-                  parameters: message.parameters ?? {},
-                })
-              );
+            case "data_connection_tool_invocation": {
+              await executeToolAndSendUltravoxResult({
+                ultravoxWebSocket,
+                clientWs,
+                sessionUuid,
+                toolName: message.toolName,
+                invocationId: message.invocationId,
+                parameters: message.parameters ?? {},
+                channel: "data_connection",
+              });
               break;
+            }
 
             case "error":
               console.error("Error", message);

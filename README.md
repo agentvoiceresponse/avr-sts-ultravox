@@ -88,7 +88,9 @@ Set `ULTRAVOX_EXTERNAL_VOICE_PROVIDER` to one of: `elevenlabs`, `cartesia`, `lmn
 
 When the model invokes an **AVR** client tool (`avr_hangup`, `avr_transfer`, or custom entries in `tools/`), this server runs the handler **locally** (same pattern as OpenAI STS) and sends `client_tool_result` back on the Ultravox WebSocket—no client round-trip required for telephony-style integrations.
 
-For other client tools, Ultravox sends `client_tool_invocation` or `data_connection_tool_invocation`. This server forwards them to your client as:
+AVR-named tools invoked via **`data_connection_tool_invocation`** use the same `getToolHandler` path when possible; the bridge replies with `data_connection_tool_result` on the Ultravox WebSocket.
+
+For tools without a local AVR handler, Ultravox sends `client_tool_invocation` or `data_connection_tool_invocation`. This server forwards them to your client as:
 
 ```json
 { "type": "tool_invocation", "toolName": "...", "invocationId": "...", "parameters": {} }

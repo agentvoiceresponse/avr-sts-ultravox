@@ -17,6 +17,7 @@ function loadTools() {
     if (!fs.existsSync(dirPath)) return [];
     
     return fs.readdirSync(dirPath)
+      .filter((file) => file.endsWith('.js'))
       .map(file => {
         const tool = require(path.join(dirPath, file));
         return {
