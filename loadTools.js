@@ -1,6 +1,16 @@
 const fs = require('fs');
 const path = require('path');
 
+/** Tool modules on disk must be alphanumeric plus _ or - (basename only; blocks path traversal via toolName). */
+const SAFE_DISK_TOOL_NAME = /^[a-zA-Z0-9_-]+$/;
+
+function assertSafeDiskToolName(name) {
+  if (typeof name !== 'string' || name.trim() !== name || !SAFE_DISK_TOOL_NAME.test(name)) {
+    throw new Error(`Invalid or unsafe tool name: ${typeof name === 'string' ? JSON.stringify(name) : typeof name}`);
+  }
+  return name;
+}
+
 /**
  * Loads all available tools from both avr_tools and tools directories
  * @returns {Array} List of all available tools
@@ -50,10 +60,11 @@ function loadTools() {
  * @throws {Error} If the tool is not found
  */
 function getToolHandler(name) {
-  // Possible paths for the tool file
+  const safe = assertSafeDiskToolName(name);
+
   const possiblePaths = [
-    path.join(__dirname, 'avr_tools', `${name}.js`),  // First check in avr_tools
-    path.join(__dirname, 'tools', `${name}.js`)       // Then check in tools
+    path.join(__dirname, 'avr_tools', `${safe}.js`),
+    path.join(__dirname, 'tools', `${safe}.js`),
   ];
 
   // Find the first valid path
